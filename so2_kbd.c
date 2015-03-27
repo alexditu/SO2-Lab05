@@ -39,8 +39,10 @@ MODULE_LICENSE("GPL");
 struct so2_device_data {
 	struct cdev cdev;
 	/* TODO 4: locking mechanism */
+	spinlock_t lock;
 	char buf[BUFFER_SIZE];
-	atomic_t size;
+	//atomic_t size;
+	int size;
 	/* use passcnt to hold the no. of chars that were matched so far */
 	int passcnt;
 } devs[1];
@@ -98,6 +100,9 @@ static u8 i8042_read_data(void)
 }
 
 /* TODO 2: implement interrupt handler */
+static char word[MAGIC_WORD_LEN] = MAGIC_WORD;
+
+static int pass_offset;
 irqreturn_t so2_kbd_interrupt_handle(int irq_no, void *dev_id) {
 
 	//printk(LOG_LEVEL "In: so2_kbd_interrupt_handle: %d\n", irq_no);
@@ -108,12 +113,29 @@ irqreturn_t so2_kbd_interrupt_handle(int irq_no, void *dev_id) {
 	data = i8042_read_data();
 	if (is_key_press(data)) {
 		c = get_ascii(data);
-		size = atomic_read(&devs->size);
+		
+		spin_lock(&devs->lock);
+
+		size = devs->size;
 		if (size < BUFFER_SIZE) {
 			devs->buf[size] = c;
-			atomic_set(&devs->size, size + 1);
-			printk("Pressed: %c, size: %d\n", c, size);
+			devs->size = size + 1;
+			//printk("Pressed: %c, size: %d\n", c, size);
+			if (pass_offset >= MAGIC_WORD_LEN) {
+				pass_offset = 0;
+			}
+			if (c == word[pass_offset]) {
+				pass_offset++;
+				if (pass_offset == MAGIC_WORD_LEN) {
+					printk(LOG_LEVEL "Clearing buffer\n");
+					pass_offset = 0;
+					devs->size = 0;
+					memset(devs->buf, 0, BUFFER_SIZE);
+				}
+			}
 		}
+
+		spin_unlock(&devs->lock);
 	}
 
 	return IRQ_NONE;
@@ -143,19 +165,38 @@ so2_kbd_read(struct file *file, char __user *user_buffer,
 	struct so2_device_data *data =
 		(struct so2_device_data *) file->private_data;
 	char *tmp;
+	unsigned long flags;
+	int ret;
 
+	spin_lock_irqsave(&devs->lock, flags);
 	/* check if range is valid */
-	if (*offset > atomic_read(&data->size))
+	if (*offset > data->size)
 		return 0;
 
-	if (size > atomic_read(&data->size) - *offset)
-		size = atomic_read(&data->size) - *offset;
+	if (size > data->size - *offset)
+		size = data->size - *offset;
 
 	/* TODO 4: allocate the temp buffer */
+	tmp = kmalloc_array(size, sizeof(char), GFP_ATOMIC);
+	if (tmp == NULL) {
+		printk(LOG_LEVEL "Error kmalloc\n");
+		return -ENOMEM;
+	}
 	/* TODO 4: read from the device's internal buffer to temporary
 	 * buffer , use synchronization */
-	/* TODO 4: read from the temp buffer to user buffer */
+	
+	memcpy(tmp, devs->buf, size);
+	spin_unlock_irqrestore(&devs->lock, flags);
 
+	/* TODO 4: read from the temp buffer to user buffer */
+	ret = copy_to_user(user_buffer, tmp, size);
+	if (ret != 0) {
+		printk(LOG_LEVEL "Error copy_to_user\n");
+		kfree(tmp);
+		return -1;
+	}
+
+	kfree(tmp);
 	/* update offset */
 	*offset += size;
 
@@ -202,7 +243,8 @@ static int so2_kbd_init(void)
 		goto out2;
 	}
 
-	atomic_set(&devs[0].size, 0);
+	spin_lock_init(&devs->lock);
+	devs->size = 0;
 	cdev_init(&devs[0].cdev, &so2_kbd_fops);
 	cdev_add(&devs[0].cdev, MKDEV(SO2_KBD_MAJOR, SO2_KBD_MINOR), 1);
 
